@@ -1,6 +1,7 @@
 import re
 import requests
 import urllib.parse
+import base64
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
 import logging
@@ -23,7 +24,6 @@ class ListHandler(logging.Handler):
         try:
             log_entry = self.format(record)
             self.log_records.append(log_entry)
-            # 保持列表长度，移除旧的
             if len(self.log_records) > self.max_records:
                 self.log_records.pop(0)
         except Exception:
@@ -33,12 +33,10 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%H:%M:%S')
 
-# 控制台输出
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# 内存输出（给网页看）
 web_log_handler = ListHandler()
 web_log_handler.setFormatter(formatter)
 logger.addHandler(web_log_handler)
@@ -110,6 +108,7 @@ class LiveMonitor:
                     a_tags = channel_li.find_all('a', class_='item')
                     for a in a_tags:
                         title = a.get_text(strip=True)
+                        # 优先使用 data-play (通常是iframe或加密页)，如果没有则用 href
                         href = a.get('data-play') or a.get('href')
                         if href and href.startswith('http'):
                             links.append({'title': title, 'url': href})
@@ -119,31 +118,80 @@ class LiveMonitor:
                 continue
         return matches
 
-    def decode_stream(self, html, base_url):
-        try:
-            m3u8_pattern = re.compile(r"['\"](http[^'\"]+?\.m3u8.*?)['\"]")
-            direct_match = m3u8_pattern.search(html)
-            if direct_match: return direct_match.group(1)
+    def deep_decode(self, html, current_url, depth=0):
+        """
+        深度挖掘页面中的 m3u8
+        depth: 递归深度，防止无限循环
+        """
+        if depth > 1: # 最多往下挖 1 层 iframe
+            return None
 
-            soup = BeautifulSoup(html, 'lxml')
-            iframe = soup.find('iframe')
-            if iframe:
-                src = iframe.get('src')
-                if src:
-                    if not src.startswith('http'): src = urllib.parse.urljoin(base_url, src)
+        # 策略 1: 直接匹配 m3u8 链接 (最快)
+        # 匹配 http...m3u8 或者是 /...m3u8
+        m3u8_pattern = re.compile(r"['\"]((?:http[s]?://|/)[^'\"]+?\.m3u8(?:[^'\"]*)?)['\"]")
+        direct_match = m3u8_pattern.search(html)
+        if direct_match:
+            found_url = direct_match.group(1)
+            # 处理相对路径
+            if found_url.startswith('/'):
+                found_url = urllib.parse.urljoin(current_url, found_url)
+            # 过滤掉非 http 的垃圾数据
+            if found_url.startswith('http'):
+                return found_url
+
+        # 策略 2: 匹配常见播放器参数 (source: "...", file: "...", video: "...")
+        # 很多体育网站用 Clappr 或 DPlayer
+        player_pattern = re.compile(r"(?:source|file|video|url)\s*[:=]\s*['\"](http[^'\"]+)['\"]")
+        player_match = player_pattern.search(html)
+        if player_match:
+            return player_match.group(1)
+
+        # 策略 3: Base64 暴力解码
+        # 寻找长字符串，尝试解码，如果解码后包含 .m3u8 则是目标
+        # 匹配长度至少 20 的 base64 字符串
+        b64_candidates = re.findall(r"['\"]([a-zA-Z0-9+/=]{20,})['\"]", html)
+        for cand in b64_candidates:
+            try:
+                decoded_bytes = base64.b64decode(cand)
+                decoded_str = decoded_bytes.decode('utf-8', errors='ignore')
+                if '.m3u8' in decoded_str and decoded_str.strip().startswith('http'):
+                    return decoded_str.strip()
+            except:
+                pass
+
+        # 策略 4: Iframe 递归挖掘 (关键步骤)
+        soup = BeautifulSoup(html, 'lxml')
+        iframes = soup.find_all('iframe')
+        for iframe in iframes:
+            src = iframe.get('src')
+            if src:
+                # 处理相对路径
+                if not src.startswith('http'):
+                    src = urllib.parse.urljoin(current_url, src)
+                
+                logger.info(f"    └── 发现子线路(iframe)，深入挖掘: {src[:50]}...")
+                try:
+                    # 请求子页面时，务必带上 Referer，很多源会校验这个
+                    sub_headers = self.headers.copy()
+                    sub_headers['Referer'] = current_url
+                    
                     with requests.Session() as s:
-                        r = s.get(src, headers=self.headers, timeout=5)
-                        iframe_match = m3u8_pattern.search(r.text)
-                        if iframe_match: return iframe_match.group(1)
-        except Exception:
-            pass
+                        r = s.get(src, headers=sub_headers, timeout=6)
+                        if r.status_code == 200:
+                            # 递归调用
+                            result = self.deep_decode(r.text, src, depth=depth+1)
+                            if result:
+                                return result
+                except Exception as e:
+                    logger.warning(f"    iframe 请求失败: {e}")
+                    pass
+        
         return None
 
     def update_playlist(self):
         global current_playlist_content
         
         if self.is_running:
-            logger.warning("任务正在运行中，跳过本次触发")
             return
             
         self.is_running = True
@@ -158,30 +206,47 @@ class LiveMonitor:
                 html = self.parse_js_to_html(js_code)
                 matches = self.extract_matches(html)
                 self.match_count = len(matches)
-                logger.info(f"解析到 {self.match_count} 场比赛")
+                logger.info(f"解析到 {self.match_count} 场比赛，开始提取播放源...")
                 
                 valid_streams = []
                 for match in matches:
+                    # 限制每场比赛尝试的线路数，避免太慢
                     for link in match['links']:
                         try:
                             target_url = link['url']
                             final_url = None
+                            
+                            # 如果链接本身就是 m3u8
                             if '.m3u8' in target_url:
                                 final_url = target_url
                             else:
+                                # 访问播放页
+                                logger.info(f"正在解析: {match['name']} - {link['title']}")
                                 resp = requests.get(target_url, headers=self.headers, timeout=8)
                                 if resp.status_code == 200:
-                                    final_url = self.decode_stream(resp.text, target_url)
+                                    # 进入深度挖掘模式
+                                    final_url = self.deep_decode(resp.text, target_url)
+                                else:
+                                    logger.warning(f"  页面访问失败: {resp.status_code}")
                             
                             if final_url:
+                                logger.info(f"  ✅ 成功获取源: {final_url[:60]}...")
                                 valid_streams.append({
                                     'group': "JRS直播",
                                     'name': f"{match['time']} {match['name']} - {link['title']}",
                                     'url': final_url
                                 })
-                            time.sleep(0.1)
-                        except: continue
+                                # 找到一个能用的就跳过该线路的其他尝试吗？
+                                # 不跳过，因为不同线路可能清晰度不同，全部保留
+                            else:
+                                logger.info(f"  ❌ 未找到源")
+                                
+                            time.sleep(0.2)
+                        except Exception as e:
+                             logger.error(f"  出错: {e}")
+                             continue
                 
+                # 生成 M3U 内容
                 new_content = "#EXTM3U\n"
                 for s in valid_streams:
                     new_content += f'#EXTINF:-1 group-title="{s["group"]}", {s["name"]}\n'
@@ -189,11 +254,10 @@ class LiveMonitor:
                 
                 current_playlist_content = new_content
                 self.stream_count = len(valid_streams)
-                logger.info(f"更新成功! 有效源: {self.stream_count}")
+                logger.info(f"更新成功! 找到 {self.stream_count} 个有效源")
             else:
-                logger.warning("未获取到JS代码，可能接口变动或IP被限制")
-                if not self.last_error:
-                    self.last_error = "无法获取JS代码"
+                logger.warning("未获取到比赛列表数据")
+                if not self.last_error: self.last_error = "无法获取列表"
 
         except Exception as e:
             logger.error(f"致命错误: {str(e)}")
@@ -215,6 +279,7 @@ DEBUG_HTML = """
 <head>
     <title>JRS Monitor Debug</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="utf-8">
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; background: #f4f4f9; }
         .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
@@ -227,8 +292,8 @@ DEBUG_HTML = """
         .btn { display: inline-block; background: #28a745; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; font-weight: bold; }
         .btn:hover { background: #218838; }
         .btn-refresh { cursor: pointer; border: none; font-size: 16px; }
-        .logs { background: #2d2d2d; color: #ccc; padding: 15px; border-radius: 6px; height: 300px; overflow-y: scroll; font-family: monospace; font-size: 12px; }
-        .log-entry { margin-bottom: 5px; border-bottom: 1px solid #444; padding-bottom: 2px; }
+        .logs { background: #2d2d2d; color: #ccc; padding: 15px; border-radius: 6px; height: 400px; overflow-y: scroll; font-family: monospace; font-size: 12px; line-height: 1.4; }
+        .log-entry { margin-bottom: 5px; border-bottom: 1px solid #444; padding-bottom: 2px; word-break: break-all; }
         .status-running { color: orange; font-weight: bold; animation: blink 1s infinite; }
         .error-msg { color: red; background: #ffeeee; padding: 10px; border-radius: 5px; }
         @keyframes blink { 50% { opacity: 0.5; } }
@@ -255,7 +320,9 @@ DEBUG_HTML = """
                 <span class="stat-label">发现比赛</span>
             </div>
             <div class="stat-item">
-                <span class="stat-value">{{ monitor.stream_count }}</span>
+                <span class="stat-value" style="color: {% if monitor.stream_count > 0 %}green{% else %}red{% endif %}">
+                    {{ monitor.stream_count }}
+                </span>
                 <span class="stat-label">有效源</span>
             </div>
             <div class="stat-item">
@@ -274,7 +341,6 @@ DEBUG_HTML = """
     <div class="card">
         <h2>实时日志 (最近100条)</h2>
         <div class="logs">
-            <!-- 直接遍历 Python 传入的 reversed 列表 -->
             {% for log in logs %}
             <div class="log-entry">{{ log }}</div>
             {% endfor %}
@@ -292,17 +358,10 @@ def home():
 @app.route('/debug')
 def debug_page():
     try:
-        # 关键修复：创建列表副本并在此处反转，防止模板渲染时列表发生变化
-        # list() 创建副本，[::-1] 进行反转
+        # 使用副本防止并发修改
         safe_logs = list(web_log_handler.log_records)[::-1]
-        
-        return render_template_string(
-            DEBUG_HTML, 
-            monitor=monitor, 
-            logs=safe_logs
-        )
+        return render_template_string(DEBUG_HTML, monitor=monitor, logs=safe_logs)
     except Exception as e:
-        # 如果页面渲染出错，返回简单的错误文本，方便调试
         return f"Error rendering page: {str(e)}", 500
 
 @app.route('/trigger_update')
@@ -317,7 +376,10 @@ def playlist():
 
 # --- 定时调度 ---
 def run_schedule():
+    # 启动等待 3 秒再运行，防止 Flask 还没起来
+    time.sleep(3)
     monitor.update_playlist()
+    
     interval = int(os.getenv('FETCH_INTERVAL', 300))
     schedule.every(interval).seconds.do(monitor.update_playlist)
     while True:
@@ -330,5 +392,4 @@ if __name__ == "__main__":
     t.start()
     
     port = int(os.getenv('PORT', 8080))
-    # 增加 threaded=True，虽然是默认的，但显式写出以确保
     app.run(host='0.0.0.0', port=port, threaded=True)
