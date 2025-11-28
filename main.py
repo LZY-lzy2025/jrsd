@@ -9,26 +9,26 @@ import schedule
 import os
 import threading
 import datetime
-from flask import Flask, Response, render_template_string, redirect, url_for
+# 引入 request 以防万一
+from flask import Flask, Response, render_template_string, redirect, url_for, request
 
 # --- 日志系统配置 ---
-# 创建一个自定义的日志处理器，把日志保存到内存列表中，以便在网页显示
 class ListHandler(logging.Handler):
     def __init__(self):
         super().__init__()
         self.log_records = []
-        self.max_records = 100  # 只保留最近100条
+        self.max_records = 100 
 
     def emit(self, record):
         try:
             log_entry = self.format(record)
             self.log_records.append(log_entry)
+            # 保持列表长度，移除旧的
             if len(self.log_records) > self.max_records:
                 self.log_records.pop(0)
         except Exception:
             self.handleError(record)
 
-# 初始化日志
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s', datefmt='%H:%M:%S')
@@ -56,7 +56,6 @@ class LiveMonitor:
             'User-Agent': self.ua.random,
             'Referer': 'https://www.jrs21.com/',
         }
-        # 状态统计
         self.last_update_time = "尚未运行"
         self.next_update_time = "计算中..."
         self.match_count = 0
@@ -73,18 +72,24 @@ class LiveMonitor:
             resp.encoding = 'utf-8'
             if resp.status_code == 200:
                 return resp.text
-            logger.error(f"源站返回错误代码: {resp.status_code}")
-            self.last_error = f"HTTP {resp.status_code}"
+            err_msg = f"源站返回错误代码: {resp.status_code}"
+            logger.error(err_msg)
+            self.last_error = err_msg
             return None
         except Exception as e:
-            logger.error(f"网络请求失败: {e}")
-            self.last_error = str(e)
+            err_msg = f"网络请求失败: {str(e)}"
+            logger.error(err_msg)
+            self.last_error = err_msg
             return None
 
     def parse_js_to_html(self, js_content):
-        pattern = re.compile(r"document\.write\('(.*?)'\);")
-        matches = pattern.findall(js_content)
-        return "".join(matches)
+        try:
+            pattern = re.compile(r"document\.write\('(.*?)'\);")
+            matches = pattern.findall(js_content)
+            return "".join(matches)
+        except Exception as e:
+            logger.error(f"JS解析失败: {e}")
+            return ""
 
     def extract_matches(self, html_content):
         soup = BeautifulSoup(html_content, 'lxml')
@@ -115,22 +120,23 @@ class LiveMonitor:
         return matches
 
     def decode_stream(self, html, base_url):
-        m3u8_pattern = re.compile(r"['\"](http[^'\"]+?\.m3u8.*?)['\"]")
-        direct_match = m3u8_pattern.search(html)
-        if direct_match: return direct_match.group(1)
+        try:
+            m3u8_pattern = re.compile(r"['\"](http[^'\"]+?\.m3u8.*?)['\"]")
+            direct_match = m3u8_pattern.search(html)
+            if direct_match: return direct_match.group(1)
 
-        soup = BeautifulSoup(html, 'lxml')
-        iframe = soup.find('iframe')
-        if iframe:
-            src = iframe.get('src')
-            if src:
-                if not src.startswith('http'): src = urllib.parse.urljoin(base_url, src)
-                try:
+            soup = BeautifulSoup(html, 'lxml')
+            iframe = soup.find('iframe')
+            if iframe:
+                src = iframe.get('src')
+                if src:
+                    if not src.startswith('http'): src = urllib.parse.urljoin(base_url, src)
                     with requests.Session() as s:
                         r = s.get(src, headers=self.headers, timeout=5)
                         iframe_match = m3u8_pattern.search(r.text)
                         if iframe_match: return iframe_match.group(1)
-                except: pass
+        except Exception:
+            pass
         return None
 
     def update_playlist(self):
@@ -155,7 +161,6 @@ class LiveMonitor:
                 logger.info(f"解析到 {self.match_count} 场比赛")
                 
                 valid_streams = []
-                # 限制并发或循环速度，避免被封
                 for match in matches:
                     for link in match['links']:
                         try:
@@ -174,10 +179,9 @@ class LiveMonitor:
                                     'name': f"{match['time']} {match['name']} - {link['title']}",
                                     'url': final_url
                                 })
-                            time.sleep(0.1) # 微小延时
+                            time.sleep(0.1)
                         except: continue
                 
-                # 生成 M3U 内容
                 new_content = "#EXTM3U\n"
                 for s in valid_streams:
                     new_content += f'#EXTINF:-1 group-title="{s["group"]}", {s["name"]}\n'
@@ -187,24 +191,24 @@ class LiveMonitor:
                 self.stream_count = len(valid_streams)
                 logger.info(f"更新成功! 有效源: {self.stream_count}")
             else:
-                logger.warning("未获取到JS代码")
+                logger.warning("未获取到JS代码，可能接口变动或IP被限制")
+                if not self.last_error:
+                    self.last_error = "无法获取JS代码"
 
         except Exception as e:
-            logger.error(f"致命错误: {e}")
+            logger.error(f"致命错误: {str(e)}")
             self.last_error = str(e)
         finally:
             self.is_running = False
             self.last_update_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # 计算下次运行时间（估算）
             interval = int(os.getenv('FETCH_INTERVAL', 300))
             next_time = datetime.datetime.now() + datetime.timedelta(seconds=interval)
             self.next_update_time = next_time.strftime("%H:%M:%S")
             logger.info(f"<<< 任务结束，耗时 {time.time() - start_time:.2f}秒")
 
-# 初始化全局 Monitor
 monitor = LiveMonitor()
 
-# --- HTML 模板 (Debug页面) ---
+# --- HTML 模板 ---
 DEBUG_HTML = """
 <!DOCTYPE html>
 <html>
@@ -270,7 +274,8 @@ DEBUG_HTML = """
     <div class="card">
         <h2>实时日志 (最近100条)</h2>
         <div class="logs">
-            {% for log in logs reversed %}
+            <!-- 直接遍历 Python 传入的 reversed 列表 -->
+            {% for log in logs %}
             <div class="log-entry">{{ log }}</div>
             {% endfor %}
         </div>
@@ -282,16 +287,26 @@ DEBUG_HTML = """
 # --- Flask 路由 ---
 @app.route('/')
 def home():
-    # 首页直接跳转到 debug 页面，方便查看
     return redirect(url_for('debug_page'))
 
 @app.route('/debug')
 def debug_page():
-    return render_template_string(DEBUG_HTML, monitor=monitor, logs=web_log_handler.log_records)
+    try:
+        # 关键修复：创建列表副本并在此处反转，防止模板渲染时列表发生变化
+        # list() 创建副本，[::-1] 进行反转
+        safe_logs = list(web_log_handler.log_records)[::-1]
+        
+        return render_template_string(
+            DEBUG_HTML, 
+            monitor=monitor, 
+            logs=safe_logs
+        )
+    except Exception as e:
+        # 如果页面渲染出错，返回简单的错误文本，方便调试
+        return f"Error rendering page: {str(e)}", 500
 
 @app.route('/trigger_update')
 def trigger_update():
-    # 手动触发更新（在独立线程中运行，不阻塞页面）
     if not monitor.is_running:
         threading.Thread(target=monitor.update_playlist).start()
     return redirect(url_for('debug_page'))
@@ -300,24 +315,20 @@ def trigger_update():
 def playlist():
     return Response(current_playlist_content, mimetype='audio/x-mpegurl')
 
-# --- 定时调度线程 ---
+# --- 定时调度 ---
 def run_schedule():
-    # 启动时先跑一次
     monitor.update_playlist()
-    
     interval = int(os.getenv('FETCH_INTERVAL', 300))
     schedule.every(interval).seconds.do(monitor.update_playlist)
-    
     while True:
         schedule.run_pending()
         time.sleep(1)
 
 if __name__ == "__main__":
-    # 启动后台调度
     t = threading.Thread(target=run_schedule)
     t.daemon = True
     t.start()
     
-    # 启动 Web 服务
     port = int(os.getenv('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # 增加 threaded=True，虽然是默认的，但显式写出以确保
+    app.run(host='0.0.0.0', port=port, threaded=True)
